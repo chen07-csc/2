@@ -1,228 +1,215 @@
 #!/usr/bin/env python3
 """
-HTTP MCP服务器 - 支持流式传输和飞书集成
+飞书机器人配置和工具 - 升级到 openai-python 1.0.0+ 接口
 """
 
-import asyncio
+import os
 import json
 import logging
-from typing import Any, Dict
-from datetime import datetime
+from typing import Dict, Any
+import httpx
+import asyncio
+import datetime
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import uvicorn
+# 新版 openai 客户端导入
+from openai import OpenAI
 
-# 导入飞书机器人
-from feishu_bot_config import feishu_bot
-
-# 配置日志
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="HTTP MCP Server", version="1.0.0")
-
-# 添加CORS中间件
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class MCPRequest(BaseModel):
-    jsonrpc: str = "2.0"
-    id: str
-    method: str
-    params: Dict[str, Any] = {}
-
-class MCPServer:
+class FeishuBot:
     def __init__(self):
-        self.name = "http-mcp-server"
-        self.version = "1.0.0"
-        self.tools = [
-            {
-                "name": "say_hi",
-                "description": "返回一个简单的问候语",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }
-            },
-            {
-                "name": "get_time",
-                "description": "获取当前时间",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }
-            }
-        ]
-    
-    async def handle_initialize(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """处理初始化请求"""
-        return {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {}
-            },
-            "serverInfo": {
-                "name": self.name,
-                "version": self.version
-            }
+        # 飞书机器人配置
+        self.app_id = os.getenv("FEISHU_APP_ID", "")
+        self.app_secret = os.getenv("FEISHU_APP_SECRET", "")
+        self.verification_token = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
+        self.encrypt_key = os.getenv("FEISHU_ENCRYPT_KEY", "")
+
+        # MCP服务器配置
+        self.mcp_server_url = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8080")
+        logger.info(f"MCP_SERVER_URL = {self.mcp_server_url}")
+
+        # HTTP客户端
+        self.client = httpx.AsyncClient(timeout=30.0)
+
+        # OpenAI 客户端实例
+        self.openai_client = OpenAI()
+
+        self._access_token = None
+        self._token_expire_time = None  # token过期时间戳
+
+    async def get_access_token(self) -> str:
+        """获取飞书access_token，简单缓存，过期后刷新"""
+        now = datetime.datetime.utcnow()
+        if self._access_token and self._token_expire_time and now < self._token_expire_time:
+            return self._access_token
+
+        url = "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal/"
+        data = {
+            "app_id": self.app_id,
+            "app_secret": self.app_secret
         }
-    
-    async def handle_tools_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """处理工具列表请求"""
-        return {
-            "tools": self.tools
-        }
-    
-    async def handle_tools_call(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """处理工具调用请求"""
-        tool_name = params.get("name")
-        arguments = params.get("arguments", {})
-        
-        if tool_name == "say_hi":
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "hi"
-                    }
-                ]
-            }
-        elif tool_name == "get_time":
-            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            return {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"当前时间: {current_time}"
-                    }
-                ]
-            }
-        else:
-            raise Exception(f"未知工具: {tool_name}")
-    
-    async def handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """处理MCP请求"""
-        method = request.get("method")
-        params = request.get("params", {})
-        request_id = request.get("id")
-        
         try:
-            if method == "initialize":
-                result = await self.handle_initialize(params)
-            elif method == "tools/list":
-                result = await self.handle_tools_list(params)
-            elif method == "tools/call":
-                result = await self.handle_tools_call(params)
+            resp = await self.client.post(url, json=data)
+            resp.raise_for_status()
+            j = resp.json()
+            if j.get("code") == 0:
+                self._access_token = j["app_access_token"]
+                expire_seconds = j.get("expire", 7200)
+                self._token_expire_time = now + datetime.timedelta(seconds=expire_seconds - 60)
+                logger.info("飞书access_token获取成功")
+                return self._access_token
             else:
-                raise Exception(f"未知方法: {method}")
-            
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": result
-            }
-            
+                logger.error(f"飞书access_token获取失败: {j}")
+                return ""
         except Exception as e:
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {
-                    "code": -32603,
-                    "message": str(e)
-                }
-            }
+            logger.error(f"获取飞书access_token异常: {e}")
+            return ""
 
-mcp_server = MCPServer()
+    async def send_message(self, chat_id: str, content: str, msg_type: str = "text"):
+        """发送消息到飞书群聊或单聊"""
+        token = await self.get_access_token()
+        if not token:
+            return {"error": "无法获取access_token"}
 
-@app.post("/mcp")
-async def handle_mcp_request(request: MCPRequest):
-    try:
-        response = await mcp_server.handle_request(request.dict())
-        return JSONResponse(content=response)
-    except Exception as e:
-        logger.error(f"MCP请求处理错误: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        url = "https://open.feishu.cn/open-apis/message/v4/send/"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
 
-@app.post("/mcp/stream")
-async def handle_mcp_stream_request(request: MCPRequest):
-    """处理流式MCP请求"""
-    data = request.dict()  # 先转dict方便访问
-    async def generate_stream():
+        body = {
+            "chat_id": chat_id,
+            "msg_type": msg_type,
+            "content": json.dumps({"text": content}) if msg_type == "text" else content
+        }
+
         try:
-            response = await mcp_server.handle_request(data)
-            if data.get("method") == "tools/call":
-                tool_name = data.get("params", {}).get("name")
-                if tool_name == "say_hi":
-                    # 模拟分块发送 "hi"
-                    yield f"data: {json.dumps({'type': 'partial', 'content': 'h'})}\n\n"
-                    await asyncio.sleep(0.1)
-                    yield f"data: {json.dumps({'type': 'partial', 'content': 'i'})}\n\n"
-                    await asyncio.sleep(0.1)
-                    yield f"data: {json.dumps({'type': 'complete', 'response': response})}\n\n"
+            resp = await self.client.post(url, headers=headers, json=body)
+            resp.raise_for_status()
+            j = resp.json()
+            if j.get("code") == 0:
+                logger.info(f"消息发送成功，chat_id={chat_id}")
+            else:
+                logger.error(f"消息发送失败: {j}")
+            return j
+        except Exception as e:
+            logger.error(f"发送消息异常: {e}")
+            return {"error": str(e)}
+
+    async def call_mcp_tool(self, tool_name: str, arguments: Dict[str, Any] = None) -> str:
+        """调用 MCP Server 工具接口（示例用httpx请求）"""
+        url = f"{self.mcp_server_url}/mcp"
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "feishu_call_001",
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments or {}
+            }
+        }
+        try:
+            resp = await self.client.post(url, json=payload)
+            resp.raise_for_status()
+            j = resp.json()
+            if "result" in j and "content" in j["result"]:
+                # 拼接content中的文本
+                content_text = "".join([item.get("text", "") for item in j["result"]["content"] if item.get("type") == "text"])
+                return content_text
+            return "无结果返回"
+        except Exception as e:
+            logger.error(f"调用 MCP Server 工具异常: {e}")
+            return f"调用 MCP Server 工具失败: {str(e)}"
+
+    async def get_mcp_json_from_gemini(self, user_text: str) -> dict:
+        """用 OpenAI GPT 生成 MCP JSON"""
+        prompt = (
+            "你是一个MCP协议助手。"
+            "用户输入一句自然语言，请你根据意图生成MCP协议的JSON。"
+            "如果是打招呼（如早上好、hello等），生成tools/call，name为say_hi。"
+            "如果是问时间（如现在几点、时间是什么），生成tools/call，name为get_time。"
+            "只输出JSON，不要多余内容。"
+            f"用户输入：{user_text}"
+        )
+        try:
+            response = await self.openai_client.chat.completions.acreate(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=300,
+            )
+            reply = response.choices[0].message.content.strip()
+            mcp_json = json.loads(reply)
+            logger.info(f"OpenAI MCP JSON解析成功: {mcp_json}")
+            return mcp_json
+        except Exception as e:
+            logger.error(f"OpenAI MCP JSON解析失败: {e}, 返回: {reply if 'reply' in locals() else '无内容'}")
+            return None
+
+    async def handle_message(self, event: Dict[str, Any]) -> str:
+        """处理飞书消息事件，返回回复内容"""
+        try:
+            message = event.get("message", {})
+            content = message.get("content", "")
+            if isinstance(content, str):
+                try:
+                    content = json.loads(content)
+                except:
+                    content = {"text": content}
+            text = content.get("text", "").strip()
+
+            if text == "/hi" or text.lower() == "hi":
+                return await self.call_mcp_tool("say_hi")
+            elif text == "/time" or text == "时间":
+                return await self.call_mcp_tool("get_time")
+            elif text == "/help" or text == "帮助":
+                return (
+                    "可用命令：\n"
+                    "/hi - 打招呼\n"
+                    "/time - 获取当前时间\n"
+                    "/help - 显示帮助信息"
+                )
+            else:
+                mcp_json = await self.get_mcp_json_from_gemini(text)
+                if mcp_json and mcp_json.get("method") == "tools/call":
+                    tool_name = mcp_json["params"]["name"]
+                    arguments = mcp_json["params"].get("arguments", {})
+                    return await self.call_mcp_tool(tool_name, arguments)
                 else:
-                    yield f"data: {json.dumps({'type': 'complete', 'response': response})}\n\n"
-            else:
-                yield f"data: {json.dumps({'type': 'complete', 'response': response})}\n\n"
+                    return f"收到消息: {text}\n使用 /help 查看可用命令"
+
         except Exception as e:
-            error_response = {
-                "jsonrpc": "2.0",
-                "id": data.get("id"),
-                "error": {
-                    "code": -32603,
-                    "message": str(e)
-                }
-            }
-            yield f"data: {json.dumps({'type': 'error', 'response': error_response})}\n\n"
+            logger.error(f"处理消息失败: {e}")
+            return f"处理消息时出错: {str(e)}"
 
-    return StreamingResponse(
-        generate_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
-    )
 
-@app.post("/feishu/webhook")
-async def feishu_webhook(request: Request):
-    data = await request.json()
-    logger.info(f"收到飞书请求：{data}")
-    # 处理 challenge 验证
-    if "challenge" in data:
-        return {"challenge": data["challenge"]}
-    if "event" in data:
-        event = data["event"]
-        chat_id = event.get("message", {}).get("chat_id")
-        reply = await feishu_bot.handle_message(event)
-        if chat_id and reply:
-            await feishu_bot.send_message(chat_id, reply)
-    return {"msg": "ok"}
+# 创建全局机器人实例
+feishu_bot = FeishuBot()
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
-
-@app.get("/tools")
-async def list_tools():
-    return {"tools": mcp_server.tools}
-
+# 测试代码（可删除）
 if __name__ == "__main__":
-    import os
-    port = int(os.getenv("PORT", 8001))
-    uvicorn.run(
-        "http_mcp_server:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-        log_level="info"
-    )
+    import asyncio
+
+    async def test():
+        print("测试发送消息:")
+        resp = await feishu_bot.send_message("oc_1234567890abcdef", "Hello from FeishuBot!")
+        print(resp)
+
+        print("测试调用 MCP say_hi:")
+        ret = await feishu_bot.call_mcp_tool("say_hi")
+        print("say_hi 返回:", ret)
+
+        print("测试用 OpenAI 生成 MCP JSON:")
+        mcp = await feishu_bot.get_mcp_json_from_gemini("你好")
+        print("生成的 MCP JSON:", mcp)
+
+        print("测试处理消息:")
+        reply = await feishu_bot.handle_message({
+            "message": {
+                "content": json.dumps({"text": "/hi"})
+            }
+        })
+        print("handle_message 返回:", reply)
+
+    asyncio.run(test())
