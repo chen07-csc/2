@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-飞书机器人配置和工具 - 升级到 openai-python 1.0.0+ 接口
+飞书机器人配置和工具
 """
 
 import os
@@ -10,8 +10,6 @@ from typing import Dict, Any
 import httpx
 import asyncio
 import datetime
-
-# 新版 openai 客户端导入
 from openai import OpenAI
 
 logger = logging.getLogger(__name__)
@@ -32,15 +30,16 @@ class FeishuBot:
         # HTTP客户端
         self.client = httpx.AsyncClient(timeout=30.0)
 
-        # OpenAI 客户端实例
-        self.openai_client = OpenAI()
+        # OpenAI 客户端初始化（新版SDK）
+        openai_api_key = os.getenv("OPENAI_API_KEY", "")
+        self.openai_client = OpenAI(api_key=openai_api_key)
 
         self._access_token = None
         self._token_expire_time = None  # token过期时间戳
 
     async def get_access_token(self) -> str:
         """获取飞书access_token，简单缓存，过期后刷新"""
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.timezone.utc)
         if self._access_token and self._token_expire_time and now < self._token_expire_time:
             return self._access_token
 
@@ -81,7 +80,7 @@ class FeishuBot:
         body = {
             "chat_id": chat_id,
             "msg_type": msg_type,
-            "content": json.dumps({"text": content}) if msg_type == "text" else content
+            "content": {"text": content} if msg_type == "text" else content
         }
 
         try:
@@ -98,7 +97,7 @@ class FeishuBot:
             return {"error": str(e)}
 
     async def call_mcp_tool(self, tool_name: str, arguments: Dict[str, Any] = None) -> str:
-        """调用 MCP Server 工具接口（示例用httpx请求）"""
+        """调用 MCP Server 工具接口"""
         url = f"{self.mcp_server_url}/mcp"
         payload = {
             "jsonrpc": "2.0",
@@ -114,7 +113,6 @@ class FeishuBot:
             resp.raise_for_status()
             j = resp.json()
             if "result" in j and "content" in j["result"]:
-                # 拼接content中的文本
                 content_text = "".join([item.get("text", "") for item in j["result"]["content"] if item.get("type") == "text"])
                 return content_text
             return "无结果返回"
@@ -133,7 +131,7 @@ class FeishuBot:
             f"用户输入：{user_text}"
         )
         try:
-            response = await self.openai_client.chat.completions.acreate(
+            response = await self.openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
@@ -183,11 +181,9 @@ class FeishuBot:
             logger.error(f"处理消息失败: {e}")
             return f"处理消息时出错: {str(e)}"
 
-
 # 创建全局机器人实例
 feishu_bot = FeishuBot()
 
-# 测试代码（可删除）
 if __name__ == "__main__":
     import asyncio
 
