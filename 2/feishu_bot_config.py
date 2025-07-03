@@ -8,7 +8,6 @@ import json
 import logging
 from typing import Dict, Any
 import httpx
-import asyncio
 import datetime
 import openai
 
@@ -17,37 +16,29 @@ logging.basicConfig(level=logging.INFO)
 
 class FeishuBot:
     def __init__(self):
-        # 飞书机器人配置
         self.app_id = os.getenv("FEISHU_APP_ID", "")
         self.app_secret = os.getenv("FEISHU_APP_SECRET", "")
         self.verification_token = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
         self.encrypt_key = os.getenv("FEISHU_ENCRYPT_KEY", "")
 
-        # MCP服务器配置
         self.mcp_server_url = os.getenv("MCP_SERVER_URL", "http://127.0.0.1:8080")
         logger.info(f"MCP_SERVER_URL = {self.mcp_server_url}")
 
-        # HTTP客户端
         self.client = httpx.AsyncClient(timeout=30.0)
 
-        # OpenAI 配置
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         openai.api_key = self.openai_api_key
 
         self._access_token = None
-        self._token_expire_time = None  # token过期时间戳
+        self._token_expire_time = None
 
     async def get_access_token(self) -> str:
-        """获取飞书access_token，简单缓存，过期后刷新"""
         now = datetime.datetime.utcnow()
         if self._access_token and self._token_expire_time and now < self._token_expire_time:
             return self._access_token
 
         url = "https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal/"
-        data = {
-            "app_id": self.app_id,
-            "app_secret": self.app_secret
-        }
+        data = {"app_id": self.app_id, "app_secret": self.app_secret}
         try:
             resp = await self.client.post(url, json=data)
             resp.raise_for_status()
@@ -66,21 +57,23 @@ class FeishuBot:
             return ""
 
     async def send_message(self, chat_id: str, content: str, msg_type: str = "text"):
-        """发送消息到飞书群聊或单聊"""
         token = await self.get_access_token()
         if not token:
             return {"error": "无法获取access_token"}
 
         url = "https://open.feishu.cn/open-apis/message/v4/send/"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        }
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # 注意：这里content必须是dict，不要json.dumps转字符串
+        if msg_type == "text":
+            body_content = {"text": content}
+        else:
+            body_content = content
 
         body = {
             "chat_id": chat_id,
             "msg_type": msg_type,
-            "content": json.dumps({"text": content}) if msg_type == "text" else content
+            "content": body_content
         }
 
         try:
@@ -97,25 +90,33 @@ class FeishuBot:
             return {"error": str(e)}
 
     async def call_mcp_tool(self, tool_name: str, arguments: Dict[str, Any] = None) -> str:
-        """调用 MCP Server 工具接口（示例用httpx请求）"""
-        url = f"{self.mcp_server_url}/call_tool"
+        url = f"{self.mcp_server_url}/mcp"  # 改成正确的接口路径
         payload = {
-            "tool": tool_name,
-            "arguments": arguments or {}
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments or {}
+            }
         }
         try:
             resp = await self.client.post(url, json=payload)
             resp.raise_for_status()
             j = resp.json()
-            # 假设 MCP Server 返回结果在 j["result"] 中
-            result = j.get("result", "无结果返回")
-            return result
+            # 取result.content里所有text拼起来返回
+            if "result" in j and "content" in j["result"]:
+                content_list = j["result"]["content"]
+                texts = [item.get("text", "") for item in content_list if item.get("type") == "text"]
+                return "\n".join(texts)
+            else:
+                logger.error(f"MCP Server调用异常: {j}")
+                return "调用失败"
         except Exception as e:
             logger.error(f"调用 MCP Server 工具异常: {e}")
             return f"调用 MCP Server 工具失败: {str(e)}"
 
     async def get_mcp_json_from_gemini(self, user_text: str) -> dict:
-        """用 OpenAI GPT 生成 MCP JSON"""
         prompt = (
             "你是一个MCP协议助手。"
             "用户输入一句自然语言，请你根据意图生成MCP协议的JSON。"
@@ -140,7 +141,6 @@ class FeishuBot:
             return None
 
     async def handle_message(self, event: Dict[str, Any]) -> str:
-        """处理飞书消息事件，返回回复内容"""
         try:
             message = event.get("message", {})
             content = message.get("content", "")
@@ -177,31 +177,3 @@ class FeishuBot:
 
 # 创建全局机器人实例
 feishu_bot = FeishuBot()
-
-# 下面是简单示例，演示如何调用
-
-if __name__ == "__main__":
-    import asyncio
-
-    async def test():
-        print("测试发送消息:")
-        resp = await feishu_bot.send_message("oc_1234567890abcdef", "Hello from FeishuBot!")
-        print(resp)
-
-        print("测试调用 MCP say_hi:")
-        ret = await feishu_bot.call_mcp_tool("say_hi")
-        print("say_hi 返回:", ret)
-
-        print("测试用 OpenAI 生成 MCP JSON:")
-        mcp = await feishu_bot.get_mcp_json_from_gemini("你好")
-        print("生成的 MCP JSON:", mcp)
-
-        print("测试处理消息:")
-        reply = await feishu_bot.handle_message({
-            "message": {
-                "content": json.dumps({"text": "/hi"})
-            }
-        })
-        print("handle_message 返回:", reply)
-
-    asyncio.run(test())
