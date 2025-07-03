@@ -9,7 +9,7 @@ import logging
 from typing import Any, Dict
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -38,11 +38,6 @@ class MCPRequest(BaseModel):
     id: str
     method: str
     params: Dict[str, Any] = {}
-
-class FeishuWebhookRequest(BaseModel):
-    challenge: str = None
-    type: str
-    event: Dict[str, Any] = {}
 
 class MCPServer:
     def __init__(self):
@@ -147,12 +142,10 @@ class MCPServer:
                 }
             }
 
-# 创建MCP服务器实例
 mcp_server = MCPServer()
 
 @app.post("/mcp")
 async def handle_mcp_request(request: MCPRequest):
-    """处理MCP请求"""
     try:
         response = await mcp_server.handle_request(request.dict())
         return JSONResponse(content=response)
@@ -163,15 +156,14 @@ async def handle_mcp_request(request: MCPRequest):
 @app.post("/mcp/stream")
 async def handle_mcp_stream_request(request: MCPRequest):
     """处理流式MCP请求"""
+    data = request.dict()  # 先转dict方便访问
     async def generate_stream():
         try:
-            response = await mcp_server.handle_request(request.dict())
-            
-            # 模拟流式响应
-            if request.method == "tools/call":
-                tool_name = request.params.get("name")
+            response = await mcp_server.handle_request(data)
+            if data.get("method") == "tools/call":
+                tool_name = data.get("params", {}).get("name")
                 if tool_name == "say_hi":
-                    # 分块发送"hi"
+                    # 模拟分块发送 "hi"
                     yield f"data: {json.dumps({'type': 'partial', 'content': 'h'})}\n\n"
                     await asyncio.sleep(0.1)
                     yield f"data: {json.dumps({'type': 'partial', 'content': 'i'})}\n\n"
@@ -181,55 +173,47 @@ async def handle_mcp_stream_request(request: MCPRequest):
                     yield f"data: {json.dumps({'type': 'complete', 'response': response})}\n\n"
             else:
                 yield f"data: {json.dumps({'type': 'complete', 'response': response})}\n\n"
-                
         except Exception as e:
             error_response = {
                 "jsonrpc": "2.0",
-                "id": request.id,
+                "id": data.get("id"),
                 "error": {
                     "code": -32603,
                     "message": str(e)
                 }
             }
             yield f"data: {json.dumps({'type': 'error', 'response': error_response})}\n\n"
-    
+
     return StreamingResponse(
         generate_stream(),
-        media_type="text/plain",
+        media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "Content-Type": "text/event-stream"
         }
     )
 
 @app.post("/feishu/webhook")
 async def feishu_webhook(request: Request):
     data = await request.json()
-    print("收到飞书请求：", data)
-    # 处理飞书 challenge 验证
+    logger.info(f"收到飞书请求：{data}")
+    # 处理 challenge 验证
     if "challenge" in data:
         return {"challenge": data["challenge"]}
-    # 只处理 event 回调
     if "event" in data:
         event = data["event"]
-        # 获取 chat_id
         chat_id = event.get("message", {}).get("chat_id")
-        # 获取自动回复内容
         reply = await feishu_bot.handle_message(event)
-        # 回复到群聊
         if chat_id and reply:
             await feishu_bot.send_message(chat_id, reply)
     return {"msg": "ok"}
 
 @app.get("/health")
 async def health_check():
-    """健康检查端点"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.get("/tools")
 async def list_tools():
-    """列出可用工具"""
     return {"tools": mcp_server.tools}
 
 if __name__ == "__main__":
@@ -239,6 +223,6 @@ if __name__ == "__main__":
         "http_mcp_server:app",
         host="0.0.0.0",
         port=port,
-        reload=False,  # 生产环境关闭自动重载
+        reload=False,
         log_level="info"
-    ) 
+    )
